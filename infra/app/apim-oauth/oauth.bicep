@@ -24,13 +24,30 @@ resource apimService 'Microsoft.ApiManagement/service@2021-08-01' existing = {
   name: apimServiceName
 }
 
+// Create user-assigned managed identity for crypto script
+resource cryptoScriptIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2018-11-30' = {
+  name: '${apimServiceName}-crypto-script-identity'
+  location: location
+}
+
 module entraApp './entra-app.bicep' = {
   name: 'entraApp'
-  params:{
+  params: {
     entraAppUniqueName: entraAppUniqueName
     entraAppDisplayName: entraAppDisplayName
     apimOauthCallback: '${apimService.properties.gatewayUrl}/oauth-callback'
     userAssignedIdentityPrincipleId: entraAppUserAssignedIdentityPrincipleId
+  }
+}
+
+// Role assignment for the crypto script identity to manage APIM named values
+resource cryptoScriptApimRoleAssignment 'Microsoft.Authorization/roleAssignments@2020-04-01-preview' = {
+  name: guid(resourceGroup().id, cryptoScriptIdentity.id, 'APIM Contributor')
+  scope: apimService
+  properties: {
+    principalId: cryptoScriptIdentity.properties.principalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '312a565d-c81f-4fd8-895a-4e21e48d571c')
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -40,10 +57,26 @@ resource cryptoValuesScript 'Microsoft.Resources/deploymentScripts@2020-10-01' =
   name: 'generateCryptoValues'
   location: location
   kind: 'AzurePowerShell'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${cryptoScriptIdentity.id}': {}
+    }
+  }
   properties: {
     azPowerShellVersion: '7.0'
     timeout: 'PT30M'
     retentionInterval: 'P1D'
+    environmentVariables: [
+      {
+        name: 'APIM_NAME'
+        value: apimServiceName
+      }
+      {
+        name: 'RESOURCEGROUP_NAME'
+        value: resourceGroup().name
+      }
+    ]
     scriptContent: '''
       # Generate random 32 bytes (256-bit) key for AES-256
       $key = New-Object byte[] 32
@@ -56,10 +89,12 @@ resource cryptoValuesScript 'Microsoft.Resources/deploymentScripts@2020-10-01' =
       $rng.GetBytes($iv)
       $ivBase64 = [Convert]::ToBase64String($iv)
       
-      # Output the values
-      $DeploymentScriptOutputs = @{}
-      $DeploymentScriptOutputs['encryptionKey'] = $keyBase64
-      $DeploymentScriptOutputs['encryptionIV'] = $ivBase64
+      # Get the resource group from the deployment context
+      $resourceGroup = $env:RESOURCEGROUP_NAME
+      
+      # Set the values in APIM named values
+      New-AzApiManagementNamedValue -Context (Get-AzApiManagement -ResourceGroupName $resourceGroup -Name $env:APIM_NAME) -NamedValueId "EncryptionKey" -Name "EncryptionKey" -Value $keyBase64 -Secret $true
+      New-AzApiManagementNamedValue -Context (Get-AzApiManagement -ResourceGroupName $resourceGroup -Name $env:APIM_NAME) -NamedValueId "EncryptionIV" -Name "EncryptionIV" -Value $ivBase64 -Secret $true
     '''
   }
 }
@@ -115,25 +150,7 @@ resource OAuthScopesNamedValue 'Microsoft.ApiManagement/service/namedValues@2021
   }
 }
 
-resource EncryptionIVNamedValue 'Microsoft.ApiManagement/service/namedValues@2021-08-01' = {
-  parent: apimService
-  name: 'EncryptionIV'
-  properties: {
-    displayName: 'EncryptionIV'
-    value: cryptoValuesScript.properties.outputs.encryptionIV
-    secret: true
-  }
-}
-
-resource EncryptionKeyNamedValue 'Microsoft.ApiManagement/service/namedValues@2021-08-01' = {
-  parent: apimService
-  name: 'EncryptionKey'
-  properties: {
-    displayName: 'EncryptionKey'
-    value: cryptoValuesScript.properties.outputs.encryptionKey
-    secret: true
-  }
-}
+// Note: EncryptionIV and EncryptionKey named values are now set directly by the deployment script
 
 resource McpClientIdNamedValue 'Microsoft.ApiManagement/service/namedValues@2021-08-01' = {
   parent: apimService
@@ -167,7 +184,7 @@ resource oauthApi 'Microsoft.ApiManagement/service/apis@2021-08-01' = {
     protocols: [
       'https'
     ]
-    serviceUrl: 'https://login.microsoftonline.com/${entraApp.outputs.entraAppTenantId}/oauth2/v2.0'
+    serviceUrl: '${environment().authentication.loginEndpoint}${entraApp.outputs.entraAppTenantId}/oauth2/v2.0'
   }
 }
 
@@ -236,8 +253,7 @@ resource oauthCallbackPolicy 'Microsoft.ApiManagement/service/apis/operations/po
     value: loadTextContent('oauth-callback.policy.xml')
   }
   dependsOn: [
-    EncryptionKeyNamedValue
-    EncryptionIVNamedValue
+    cryptoValuesScript
   ]
 }
 
